@@ -34,6 +34,22 @@ Flags:
 Currently in developing stage, so if you have any troubles
 with this exporter, please, [contact us](../about/contributing.md).
 
+## Route-level gauges
+
+When `log_general_stats_prom` is enabled, Odyssey now emits additional gauges on the `/metrics` endpoint:
+
+- `server_pool_active_route{user="<user>",database="<db>"}` — active backend connections for a specific route.
+- `server_pool_idle_route{user="<user>",database="<db>"}` — idle backend connections kept warm for that route.
+- `server_pool_capacity_route{user="<user>",database="<db>"}` — configured connection ceiling (`pool_size`); falls back to the current pool size when the setting is unset.
+
+The legacy aggregate gauges `server_pool_active` and `server_pool_idle` remain available without labels for backwards compatibility. To monitor pool saturation you can query, for example:
+
+```
+server_pool_active_route / server_pool_capacity_route
+```
+
+Values close to `1` indicate that a route is exhausting its configured server pool.
+
 ## Legacy built in support
 
 Not supported anymore. See example of usage in [docker/prometheus-legacy/](https://github.com/yandex/odyssey/tree/master/docker/prometheus-legacy/)

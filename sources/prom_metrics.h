@@ -16,6 +16,9 @@ struct od_prom_metrics {
 	prom_gauge_t *user_len;
 	prom_gauge_t *server_pool_active;
 	prom_gauge_t *server_pool_idle;
+	prom_gauge_t *server_pool_active_route;
+	prom_gauge_t *server_pool_idle_route;
+	prom_gauge_t *server_pool_capacity_route;
 	prom_gauge_t *msg_allocated;
 	prom_gauge_t *msg_cache_count;
 	prom_gauge_t *msg_cache_gc_count;
@@ -65,9 +68,14 @@ extern int od_prom_metrics_write_stat_cb(
 	od_prom_metrics_t *self, const char *user, const char *database,
 	u_int64_t database_len, u_int64_t user_len, u_int64_t client_pool_total,
 	u_int64_t server_pool_active, u_int64_t server_pool_idle,
-	u_int64_t avg_tx_count, u_int64_t avg_tx_time,
-	u_int64_t avg_query_count, u_int64_t avg_query_time,
-	u_int64_t avg_recv_client, u_int64_t avg_recv_server);
+	u_int64_t server_pool_capacity, u_int64_t avg_tx_count,
+	u_int64_t avg_tx_time, u_int64_t avg_query_count,
+	u_int64_t avg_query_time, u_int64_t avg_recv_client,
+	u_int64_t avg_recv_server);
+
+extern int od_prom_metrics_set_server_pool_totals(od_prom_metrics_t *self,
+						  u_int64_t server_pool_active,
+						  u_int64_t server_pool_idle);
 
 extern const char *od_prom_metrics_get_stat_cb(od_prom_metrics_t *self);
 

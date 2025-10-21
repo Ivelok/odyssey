@@ -186,6 +186,22 @@ int od_prom_metrics_init(struct od_prom_metrics *self)
 	if (err)
 		return err;
 	const char *user_labels[2] = { "user", "database" };
+	self->server_pool_active_route =
+		prom_gauge_new("server_pool_active_route",
+			       "Active servers per route", 2, user_labels);
+	prom_collector_add_metric(stat_route_metrics_collector,
+				  self->server_pool_active_route);
+	self->server_pool_idle_route =
+		prom_gauge_new("server_pool_idle_route",
+			       "Idle servers per route", 2, user_labels);
+	prom_collector_add_metric(stat_route_metrics_collector,
+				  self->server_pool_idle_route);
+	self->server_pool_capacity_route =
+		prom_gauge_new("server_pool_capacity_route",
+			       "Configured server capacity per route", 2,
+			       user_labels);
+	prom_collector_add_metric(stat_route_metrics_collector,
+				  self->server_pool_capacity_route);
 	self->avg_tx_count =
 		prom_gauge_new("avg_tx_count",
 			       "Average transactions count per second", 2,
@@ -322,9 +338,10 @@ int od_prom_metrics_write_stat_cb(
 	od_prom_metrics_t *self, const char *user, const char *database,
 	u_int64_t database_len, u_int64_t user_len, u_int64_t client_pool_total,
 	u_int64_t server_pool_active, u_int64_t server_pool_idle,
-	u_int64_t avg_tx_count, u_int64_t avg_tx_time,
-	u_int64_t avg_query_count, u_int64_t avg_query_time,
-	u_int64_t avg_recv_client, u_int64_t avg_recv_server)
+	u_int64_t server_pool_capacity, u_int64_t avg_tx_count,
+	u_int64_t avg_tx_time, u_int64_t avg_query_count,
+	u_int64_t avg_query_time, u_int64_t avg_recv_client,
+	u_int64_t avg_recv_server)
 {
 	if (self == NULL)
 		return 1;
@@ -341,12 +358,16 @@ int od_prom_metrics_write_stat_cb(
 			     database_label);
 	if (err)
 		return err;
-	err = prom_gauge_set(self->server_pool_active,
-			     (double)server_pool_active, NULL);
+	err = prom_gauge_set(self->server_pool_active_route,
+			     (double)server_pool_active, user_database_label);
 	if (err)
 		return err;
-	err = prom_gauge_set(self->server_pool_idle, (double)server_pool_idle,
-			     NULL);
+	err = prom_gauge_set(self->server_pool_idle_route,
+			     (double)server_pool_idle, user_database_label);
+	if (err)
+		return err;
+	err = prom_gauge_set(self->server_pool_capacity_route,
+			     (double)server_pool_capacity, user_database_label);
 	if (err)
 		return err;
 	err = prom_gauge_set(self->avg_tx_count, (double)avg_tx_count,
@@ -371,6 +392,25 @@ int od_prom_metrics_write_stat_cb(
 		return err;
 	err = prom_gauge_set(self->avg_recv_client, (double)avg_recv_client,
 			     user_database_label);
+	if (err)
+		return err;
+	return 0;
+}
+
+int od_prom_metrics_set_server_pool_totals(od_prom_metrics_t *self,
+					   u_int64_t server_pool_active,
+					   u_int64_t server_pool_idle)
+{
+	if (self == NULL)
+		return 1;
+
+	int err;
+	err = prom_gauge_set(self->server_pool_active,
+			     (double)server_pool_active, NULL);
+	if (err)
+		return err;
+	err = prom_gauge_set(self->server_pool_idle, (double)server_pool_idle,
+			     NULL);
 	if (err)
 		return err;
 	return 0;
