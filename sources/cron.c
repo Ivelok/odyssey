@@ -11,6 +11,11 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+typedef struct {
+	uint64_t server_pool_active;
+	uint64_t server_pool_idle;
+} od_cron_metrics_totals_t;
+
 static int od_cron_stat_cb(od_route_t *route, od_stat_t *current,
 			   od_stat_t *avg,
 #ifdef PROM_FOUND
@@ -30,6 +35,7 @@ static int od_cron_stat_cb(od_route_t *route, od_stat_t *current,
 		int client_pool_total;
 		int server_pool_active;
 		int server_pool_idle;
+		int server_pool_capacity;
 		uint64_t avg_count_tx;
 		uint64_t avg_tx_time;
 		uint64_t avg_count_query;
@@ -50,6 +56,12 @@ static int od_cron_stat_cb(od_route_t *route, od_stat_t *current,
 	info.server_pool_active =
 		od_multi_pool_count_active(route->server_pools);
 	info.server_pool_idle = od_multi_pool_count_idle(route->server_pools);
+	info.server_pool_capacity =
+		route->rule->pool ? route->rule->pool->size : 0;
+	if (info.server_pool_capacity <= 0) {
+		info.server_pool_capacity =
+			od_multi_pool_total(route->server_pools);
+	}
 
 	info.avg_count_query = avg->count_query;
 	info.avg_count_tx = avg->count_tx;
@@ -62,13 +74,19 @@ static int od_cron_stat_cb(od_route_t *route, od_stat_t *current,
 
 #ifdef PROM_FOUND
 	if (instance->config.log_general_stats_prom) {
+		od_cron_metrics_totals_t *totals = argv[1];
+		if (totals) {
+			totals->server_pool_active += info.server_pool_active;
+			totals->server_pool_idle += info.server_pool_idle;
+		}
 		od_prom_metrics_write_stat_cb(
 			metrics, info.user, info.database, info.database_len,
 			info.user_len, info.client_pool_total,
 			info.server_pool_active, info.server_pool_idle,
-			info.avg_count_tx, info.avg_tx_time,
-			info.avg_count_query, info.avg_query_time,
-			info.avg_recv_client, info.avg_recv_server);
+			info.server_pool_capacity, info.avg_count_tx,
+			info.avg_tx_time, info.avg_count_query,
+			info.avg_query_time, info.avg_recv_client,
+			info.avg_recv_server);
 		if (instance->config.log_route_stats_prom) {
 			char *prom_log =
 				(char *)od_prom_metrics_get_stat_cb(metrics);
@@ -176,12 +194,27 @@ static inline void od_cron_stat(od_cron_t *cron)
 	} else {
 		stat_cb = od_cron_stat_cb;
 	}
+#ifdef PROM_FOUND
+	void *argv[] = { instance, NULL };
+	od_cron_metrics_totals_t totals = { 0 };
+	argv[1] = &totals;
+#else
 	void *argv[] = { instance };
+#endif
 	od_router_stat(router, cron->stat_time_us,
 #ifdef PROM_FOUND
 		       cron->metrics,
 #endif
 		       stat_cb, argv);
+
+#ifdef PROM_FOUND
+	if (instance->config.log_general_stats_prom &&
+	    stat_cb == od_cron_stat_cb) {
+		od_prom_metrics_set_server_pool_totals(
+			cron->metrics, totals.server_pool_active,
+			totals.server_pool_idle);
+	}
+#endif
 
 	/* update current stat time mark */
 	cron->stat_time_us = machine_time_us();
