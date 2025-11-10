@@ -69,6 +69,36 @@ var (
 		[]string{"database"}, nil,
 	)
 
+	avgRecvBytesPerSecondDescription = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "database", "avg_recv_bytes_per_second"),
+		"Average bytes per second received from clients (SHOW STATS avg_recv)",
+		[]string{"database"}, nil,
+	)
+
+	avgSentBytesPerSecondDescription = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "database", "avg_sent_bytes_per_second"),
+		"Average bytes per second sent to servers (SHOW STATS avg_sent)",
+		[]string{"database"}, nil,
+	)
+
+	avgXactTimeSecondsDescription = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "database", "avg_xact_time_seconds"),
+		"Average transaction time in seconds over the stats window (SHOW STATS avg_xact_time)",
+		[]string{"database"}, nil,
+	)
+
+	avgQueryTimeSecondsDescription = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "database", "avg_query_time_seconds"),
+		"Average query time in seconds over the stats window (SHOW STATS avg_query_time)",
+		[]string{"database"}, nil,
+	)
+
+	avgWaitTimeSecondsDescription = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "database", "avg_wait_time_seconds"),
+		"Average wait time for a server in seconds over the stats window (SHOW STATS avg_wait_time)",
+		[]string{"database"}, nil,
+	)
+
 	clientPoolActiveRouteDescription = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "client_pool", "active_route"),
 		"Active clients currently using the route",
@@ -388,8 +418,8 @@ func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[routeKey]f
 		}
 	}
 
-	// require pool_size and at least one database column
-	if poolSizeIdx == -1 || (dbIdx == -1 && nameIdx == -1) {
+	// require pool_size and route name column
+	if poolSizeIdx == -1 || nameIdx == -1 {
 		return nil, fmt.Errorf("unexpected databases output format")
 	}
 
@@ -410,11 +440,12 @@ func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[routeKey]f
 			return nil, fmt.Errorf("error scanning databases row: %w", err)
 		}
 
-		backendDatabase := ""
-		if dbIdx != -1 && rawColumns[dbIdx] != nil {
-			backendDatabase = string(rawColumns[dbIdx])
-		} else if nameIdx != -1 && rawColumns[nameIdx] != nil {
-			backendDatabase = string(rawColumns[nameIdx])
+		routeName := ""
+		if rawColumns[nameIdx] != nil {
+			routeName = string(rawColumns[nameIdx])
+		} else if dbIdx != -1 && rawColumns[dbIdx] != nil {
+			// defensive fallback, should not happen
+			routeName = string(rawColumns[dbIdx])
 		}
 
 		backendUser := ""
@@ -428,12 +459,26 @@ func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[routeKey]f
 			if poolSizeStr != "" {
 				poolSizeValue, err = strconv.ParseFloat(poolSizeStr, 64)
 				if err != nil {
-					return nil, fmt.Errorf("can't parse pool_size for %s: %w", backendDatabase, err)
-				}
+				return nil, fmt.Errorf("can't parse pool_size for %s: %w", routeName, err)
 			}
 		}
+	}
 
-        result[routeKey{database: backendDatabase, user: backendUser}] = poolSizeValue
+        // Store capacity for exact route+user (by route alias)
+        result[routeKey{database: routeName, user: backendUser}] = poolSizeValue
+        // Also store a route-wide fallback under empty user, prefer the maximum if multiple users exist
+        if existing, ok := result[routeKey{database: routeName, user: ""}]; !ok || poolSizeValue > existing {
+            result[routeKey{database: routeName, user: ""}] = poolSizeValue
+        }
+        // Additionally index by backend database name (SHOW DATABASES "database" column) to handle routes
+        // that may not expose alias consistently across commands in some setups
+        if dbIdx != -1 && rawColumns[dbIdx] != nil {
+            backendDB := string(rawColumns[dbIdx])
+            result[routeKey{database: backendDB, user: backendUser}] = poolSizeValue
+            if existing, ok := result[routeKey{database: backendDB, user: ""}]; !ok || poolSizeValue > existing {
+                result[routeKey{database: backendDB, user: ""}] = poolSizeValue
+            }
+        }
 	}
 
 	if err := rows.Err(); err != nil {
@@ -607,19 +652,34 @@ func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.
 		return fmt.Errorf("stats output has no columns")
 	}
 
-	databaseIdx := -1
-	avgXactIdx := -1
-	avgQueryIdx := -1
-	for idx, name := range columns {
-		switch name {
-		case "database":
-			databaseIdx = idx
-		case "avg_xact_count":
-			avgXactIdx = idx
-		case "avg_query_count":
-			avgQueryIdx = idx
-		}
-	}
+    databaseIdx := -1
+    avgXactIdx := -1
+    avgQueryIdx := -1
+    avgRecvIdx := -1
+    avgSentIdx := -1
+    avgXactTimeIdx := -1
+    avgQueryTimeIdx := -1
+    avgWaitTimeIdx := -1
+    for idx, name := range columns {
+        switch name {
+        case "database":
+            databaseIdx = idx
+        case "avg_xact_count":
+            avgXactIdx = idx
+        case "avg_query_count":
+            avgQueryIdx = idx
+        case "avg_recv":
+            avgRecvIdx = idx
+        case "avg_sent":
+            avgSentIdx = idx
+        case "avg_xact_time":
+            avgXactTimeIdx = idx
+        case "avg_query_time":
+            avgQueryTimeIdx = idx
+        case "avg_wait_time":
+            avgWaitTimeIdx = idx
+        }
+    }
 
 	if databaseIdx == -1 || avgXactIdx == -1 || avgQueryIdx == -1 {
 		return fmt.Errorf("unexpected stats columns, database=%d avg_xact_count=%d avg_query_count=%d", databaseIdx, avgXactIdx, avgQueryIdx)
@@ -647,21 +707,65 @@ func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.
 			continue
 		}
 
-		avgTxValue := 0.0
-		if rawColumns[avgXactIdx] != nil {
-			avgTxValue, err = strconv.ParseFloat(string(rawColumns[avgXactIdx]), 64)
-			if err != nil {
-				return fmt.Errorf("can't parse avg_xact_count for %s: %w", database, err)
-			}
-		}
+        avgTxValue := 0.0
+        if rawColumns[avgXactIdx] != nil {
+            avgTxValue, err = strconv.ParseFloat(string(rawColumns[avgXactIdx]), 64)
+            if err != nil {
+                return fmt.Errorf("can't parse avg_xact_count for %s: %w", database, err)
+            }
+        }
 
-		avgQueryValue := 0.0
-		if rawColumns[avgQueryIdx] != nil {
-			avgQueryValue, err = strconv.ParseFloat(string(rawColumns[avgQueryIdx]), 64)
-			if err != nil {
-				return fmt.Errorf("can't parse avg_query_count for %s: %w", database, err)
-			}
-		}
+        avgQueryValue := 0.0
+        if rawColumns[avgQueryIdx] != nil {
+            avgQueryValue, err = strconv.ParseFloat(string(rawColumns[avgQueryIdx]), 64)
+            if err != nil {
+                return fmt.Errorf("can't parse avg_query_count for %s: %w", database, err)
+            }
+        }
+
+        avgRecvBps := 0.0
+        if avgRecvIdx != -1 && rawColumns[avgRecvIdx] != nil {
+            avgRecvBps, err = strconv.ParseFloat(string(rawColumns[avgRecvIdx]), 64)
+            if err != nil {
+                return fmt.Errorf("can't parse avg_recv for %s: %w", database, err)
+            }
+        }
+
+        avgSentBps := 0.0
+        if avgSentIdx != -1 && rawColumns[avgSentIdx] != nil {
+            avgSentBps, err = strconv.ParseFloat(string(rawColumns[avgSentIdx]), 64)
+            if err != nil {
+                return fmt.Errorf("can't parse avg_sent for %s: %w", database, err)
+            }
+        }
+
+        // SHOW STATS times are in microseconds; convert to seconds for *_seconds metrics
+        avgXactTimeSec := 0.0
+        if avgXactTimeIdx != -1 && rawColumns[avgXactTimeIdx] != nil {
+            v, convErr := strconv.ParseFloat(string(rawColumns[avgXactTimeIdx]), 64)
+            if convErr != nil {
+                return fmt.Errorf("can't parse avg_xact_time for %s: %w", database, convErr)
+            }
+            avgXactTimeSec = v / 1e6
+        }
+
+        avgQueryTimeSec := 0.0
+        if avgQueryTimeIdx != -1 && rawColumns[avgQueryTimeIdx] != nil {
+            v, convErr := strconv.ParseFloat(string(rawColumns[avgQueryTimeIdx]), 64)
+            if convErr != nil {
+                return fmt.Errorf("can't parse avg_query_time for %s: %w", database, convErr)
+            }
+            avgQueryTimeSec = v / 1e6
+        }
+
+        avgWaitTimeSec := 0.0
+        if avgWaitTimeIdx != -1 && rawColumns[avgWaitTimeIdx] != nil {
+            v, convErr := strconv.ParseFloat(string(rawColumns[avgWaitTimeIdx]), 64)
+            if convErr != nil {
+                return fmt.Errorf("can't parse avg_wait_time for %s: %w", database, convErr)
+            }
+            avgWaitTimeSec = v / 1e6
+        }
 
 		ch <- prometheus.MustNewConstMetric(
 			avgTxCountDescription,
@@ -670,12 +774,53 @@ func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.
 			database,
 		)
 
-		ch <- prometheus.MustNewConstMetric(
-			avgQueryCountDescription,
-			prometheus.GaugeValue,
-			avgQueryValue,
-			database,
-		)
+        ch <- prometheus.MustNewConstMetric(
+            avgQueryCountDescription,
+            prometheus.GaugeValue,
+            avgQueryValue,
+            database,
+        )
+
+        if avgRecvIdx != -1 {
+            ch <- prometheus.MustNewConstMetric(
+                avgRecvBytesPerSecondDescription,
+                prometheus.GaugeValue,
+                avgRecvBps,
+                database,
+            )
+        }
+        if avgSentIdx != -1 {
+            ch <- prometheus.MustNewConstMetric(
+                avgSentBytesPerSecondDescription,
+                prometheus.GaugeValue,
+                avgSentBps,
+                database,
+            )
+        }
+        if avgXactTimeIdx != -1 {
+            ch <- prometheus.MustNewConstMetric(
+                avgXactTimeSecondsDescription,
+                prometheus.GaugeValue,
+                avgXactTimeSec,
+                database,
+            )
+        }
+        if avgQueryTimeIdx != -1 {
+            ch <- prometheus.MustNewConstMetric(
+                avgQueryTimeSecondsDescription,
+                prometheus.GaugeValue,
+                avgQueryTimeSec,
+                database,
+            )
+        }
+        if avgWaitTimeIdx != -1 {
+            ch <- prometheus.MustNewConstMetric(
+                avgWaitTimeSecondsDescription,
+                prometheus.GaugeValue,
+                avgWaitTimeSec,
+                database,
+            )
+        }
 	}
 
 	return rows.Err()
@@ -794,11 +939,13 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
                 continue
             case "sv_used":
                 serverUsed = value
-                // do not continue, let mapping below export per-state metric too
+                continue
             case "sv_tested":
                 serverTested = value
+                continue
             case "sv_login":
                 serverLogin = value
+                continue
             }
 
             // Ignore deprecated microseconds column silently
@@ -828,6 +975,12 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
             configuredCapacity = v
         } else if v, ok := capacities[routeKey{database: database, user: ""}]; ok {
             configuredCapacity = v
+        }
+
+        // If SHOW DATABASES did not yield a capacity for this route (or reported 0/unlimited),
+        // fall back to the observed current server slots (sv_active + sv_idle) as a best-effort proxy.
+        if configuredCapacity <= 0 {
+            configuredCapacity = serverActive + serverIdle
         }
         ch <- prometheus.MustNewConstMetric(
             serverPoolCapacityConfiguredRouteDescription,

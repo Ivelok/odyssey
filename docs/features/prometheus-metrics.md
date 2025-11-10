@@ -43,7 +43,7 @@ The Go-based exporter scrapes `SHOW POOLS_EXTENDED;` and `SHOW DATABASES;` and n
 | `odyssey_client_pool_active_route` | `user`, `database` | Gauge | Clients currently using the route. |
 | `odyssey_client_pool_waiting_route` | `user`, `database` | Gauge | Clients blocked waiting for a server connection. |
 | `odyssey_client_pool_maxwait_seconds_route` | `user`, `database` | Gauge | Maximum observed wait in seconds. |
-| `odyssey_server_pool_capacity_configured_route` | `user`, `database` | Gauge | Configured `pool_size` from `SHOW DATABASES` (`0` means unlimited). |
+| `odyssey_server_pool_capacity_configured_route` | `user`, `database` | Gauge | Configured `pool_size` from `SHOW DATABASES` (`0` means unlimited). When Odyssey doesn’t expose the mapping for a route, the exporter falls back to the observed `active+idle` at scrape time. |
 | `odyssey_route_pool_mode_info` | `user`, `database`, `mode` | Gauge | `1` for the active pool mode (`session`, `transaction`, `statement`). |
 | `odyssey_route_bytes_received_total` | `user`, `database` | Counter | Bytes received from clients on the route. |
 | `odyssey_route_bytes_sent_total` | `user`, `database` | Counter | Bytes sent to PostgreSQL backends. |
@@ -71,6 +71,11 @@ Odyssey’s cron thread still computes the historical averages that fed the lega
 
 - `odyssey_database_avg_tx_per_second{database="<db>"}` — average transactions per second observed over the most recent `stats_interval` window.
 - `odyssey_database_avg_query_per_second{database="<db>"}` — same concept for queries (per-second throughput).
+- `odyssey_database_avg_recv_bytes_per_second{database="<db>"}` — average bytes/sec received from clients (SHOW STATS `avg_recv`).
+- `odyssey_database_avg_sent_bytes_per_second{database="<db>"}` — average bytes/sec sent to servers (SHOW STATS `avg_sent`).
+- `odyssey_database_avg_query_time_seconds{database="<db>"}` — average query latency (seconds) over the stats window (SHOW STATS `avg_query_time`).
+- `odyssey_database_avg_xact_time_seconds{database="<db>"}` — average transaction latency (seconds) (SHOW STATS `avg_xact_time`).
+- `odyssey_database_avg_wait_time_seconds{database="<db>"}` — average wait time for server (seconds) (SHOW STATS `avg_wait_time`).
 
 ## Error counters
 
