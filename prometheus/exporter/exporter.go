@@ -30,6 +30,7 @@ const (
 	showListsCommand          = "show lists;"
 	showIsPausedCommand       = "show is_paused;"
 	showErrorsCommand         = "show errors;"
+	showStatsCommand          = "show stats;"
 	showDatabasesCommand      = "show databases;"
 	showPoolsExtendedCommand  = "show pools_extended;"
 	poolModeColumnName        = "pool_mode"
@@ -54,6 +55,12 @@ var (
 		prometheus.BuildFQName(namespace, "", "is_paused"),
 		"The Odyssey paused status",
 		nil, nil,
+	)
+
+	avgTxCountDescription = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "database", "avg_tx_per_second"),
+		"Average number of transactions per second reported by Odyssey cron",
+		[]string{"database"}, nil,
 	)
 
 	clientPoolActiveRouteDescription = prometheus.NewDesc(
@@ -363,6 +370,12 @@ func (exporter *Exporter) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
+	if err = exporter.sendStatsMetrics(ch, db); err != nil {
+		logger.Error("can't get stats metrics", "err", err.Error())
+		up = 0
+		return
+	}
+
 	poolCapacities, err := exporter.collectRoutePoolCapacities(db)
 	if err != nil {
 		logger.Error("can't get pool capacity", "err", err.Error())
@@ -597,6 +610,77 @@ func (exporter *Exporter) sendErrorMetrics(ch chan<- prometheus.Metric, db *sql.
 	}
 
 	return nil
+}
+
+func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.DB) error {
+	rows, err := db.Query(showStatsCommand)
+	if err != nil {
+		return fmt.Errorf("error getting stats: %w", err)
+	}
+	defer rows.Close()
+
+	columns, err := rows.Columns()
+	if err != nil {
+		return fmt.Errorf("can't get columns of stats")
+	}
+	if len(columns) == 0 {
+		return fmt.Errorf("stats output has no columns")
+	}
+
+	databaseIdx := -1
+	avgXactIdx := -1
+	for idx, name := range columns {
+		switch name {
+		case "database":
+			databaseIdx = idx
+		case "avg_xact_count":
+			avgXactIdx = idx
+		}
+	}
+
+	if databaseIdx == -1 || avgXactIdx == -1 {
+		return fmt.Errorf("unexpected stats columns, database=%d avg_xact_count=%d", databaseIdx, avgXactIdx)
+	}
+
+	rawColumns := make([]sql.RawBytes, len(columns))
+	dest := make([]interface{}, len(columns))
+	for i := range dest {
+		dest[i] = &rawColumns[i]
+	}
+
+	for rows.Next() {
+		for i := range rawColumns {
+			rawColumns[i] = nil
+		}
+		if err = rows.Scan(dest...); err != nil {
+			return fmt.Errorf("error scanning stats row: %w", err)
+		}
+
+		if rawColumns[databaseIdx] == nil {
+			continue
+		}
+		database := string(rawColumns[databaseIdx])
+		if database == "" {
+			continue
+		}
+
+		avgValue := 0.0
+		if rawColumns[avgXactIdx] != nil {
+			avgValue, err = strconv.ParseFloat(string(rawColumns[avgXactIdx]), 64)
+			if err != nil {
+				return fmt.Errorf("can't parse avg_xact_count for %s: %w", database, err)
+			}
+		}
+
+		ch <- prometheus.MustNewConstMetric(
+			avgTxCountDescription,
+			prometheus.GaugeValue,
+			avgValue,
+			database,
+		)
+	}
+
+	return rows.Err()
 }
 
 func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, db *sql.DB, capacities []routeCapacity) error {

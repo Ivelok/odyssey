@@ -36,7 +36,8 @@ curl tester:9876/metrics -s \
 	| grep -v 'odyssey_exporter_build_info' \
 	| grep -v 'odyssey_version_info' \
 	| grep -v 'odyssey_route_bytes_received_total{database="postgres",user="postgres"}' \
-	| grep -v 'odyssey_route_bytes_sent_total{database="postgres",user="postgres"}' > result.out
+	| grep -v 'odyssey_route_bytes_sent_total{database="postgres",user="postgres"}' \
+	| grep -v 'odyssey_database_avg_tx_per_second{database="postgres"}' > result.out
 
 echo EXPECTED START
 cat expected.out

@@ -65,6 +65,12 @@ odyssey_server_pool_active_route / odyssey_server_pool_capacity_route
 
 Values close to `1` indicate the route is exhausting its server quota. Quantile metrics expose the instantaneous TDigest estimate, so alerting thresholds should be treated like gauges (e.g., `odyssey_route_query_duration_seconds{quantile="0.95"} > 0.5`).
 
+## Database-level averages
+
+Odyssey’s cron thread still computes the historical averages that fed the legacy Prometheus endpoint. The Go exporter re-exposes the most in-demand gauge:
+
+- `odyssey_database_avg_tx_per_second{database="<db>"}` — average transactions per second observed over the most recent `stats_interval` window for that database.
+
 ## Error counters
 
 `SHOW ERRORS;` is exported as a single counter family: `odyssey_errors_total{type="OD_ECLIENT_READ"}`. Every error type reported by Odyssey becomes a label value, so new error codes do not require exporter changes.
