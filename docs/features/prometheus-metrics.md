@@ -43,7 +43,6 @@ The Go-based exporter scrapes `SHOW POOLS_EXTENDED;` and `SHOW DATABASES;` and n
 | `odyssey_client_pool_active_route` | `user`, `database` | Gauge | Clients currently using the route. |
 | `odyssey_client_pool_waiting_route` | `user`, `database` | Gauge | Clients blocked waiting for a server connection. |
 | `odyssey_client_pool_maxwait_seconds_route` | `user`, `database` | Gauge | Maximum observed wait in seconds. |
-| `odyssey_server_pool_connections_current_route` | `user`, `database` | Gauge | Current backend connections (`sv_active + sv_idle`). |
 | `odyssey_server_pool_capacity_configured_route` | `user`, `database` | Gauge | Configured `pool_size` from `SHOW DATABASES` (`0` means unlimited). |
 | `odyssey_route_pool_mode_info` | `user`, `database`, `mode` | Gauge | `1` for the active pool mode (`session`, `transaction`, `statement`). |
 | `odyssey_route_bytes_received_total` | `user`, `database` | Counter | Bytes received from clients on the route. |
@@ -51,23 +50,17 @@ The Go-based exporter scrapes `SHOW POOLS_EXTENDED;` and `SHOW DATABASES;` and n
 | `odyssey_route_tcp_connections_total` | `user`, `database` | Counter | TCP connections opened toward the backend. |
 | `odyssey_route_query_duration_seconds` | `user`, `database`, `quantile` | Gauge | Query latency quantiles (available when the `quantiles` rule option is set). |
 | `odyssey_route_transaction_duration_seconds` | `user`, `database`, `quantile` | Gauge | Transaction latency quantiles. |
-| `odyssey_server_pool_active_route` | `user`, `database` | Gauge | Active backend connections for the route. |
-| `odyssey_server_pool_idle_route` | `user`, `database` | Gauge | Idle backend connections kept hot. |
-| `odyssey_server_pool_used_route` | `user`, `database` | Gauge | Connections recently used and waiting for reuse. |
-| `odyssey_server_pool_tested_route` | `user`, `database` | Gauge | Connections undergoing health checks. |
-| `odyssey_server_pool_login_route` | `user`, `database` | Gauge | Connections currently authenticating. |
-| `odyssey_server_pool_state_route` | `user`, `database`, `state` | Gauge | Unified state family; one sample per `state` in `active|idle|used|tested|login`. |
 
 Saturation examples:
 
 ```
-odyssey_server_pool_active_route / ignoring(state) odyssey_server_pool_capacity_configured_route
+odyssey_server_pool_state_route{state="active"} / odyssey_server_pool_capacity_configured_route
 ```
 
-If `capacity_configured_route == 0` (unlimited), prefer absolute values or observed load instead of ratios:
+If `capacity_configured_route == 0` (unlimited), prefer absolute values or derive current load directly from the unified family, for example:
 
 ```
-odyssey_server_pool_connections_current_route
+sum by (user, database) (odyssey_server_pool_state_route{state=~"active|idle"})
 ```
 
 Quantiles (`*_duration_seconds`) are instantaneous TDigest estimates; treat thresholds like gauges (for example, `odyssey_route_query_duration_seconds{quantile="0.95"} > 0.5`).

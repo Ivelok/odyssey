@@ -39,10 +39,6 @@ odyssey_route_bytes_received_total{database="console",user="console"} 0
 odyssey_route_bytes_sent_total{database="console",user="console"} 0
 odyssey_route_pool_mode_info{database="console",mode="session",user="console"} 1
 odyssey_route_pool_mode_info{database="postgres",mode="session",user="postgres"} 1
-odyssey_server_pool_active_route{database="console",user="console"} 0
-odyssey_server_pool_active_route{database="postgres",user="postgres"} 0
-odyssey_server_pool_connections_current_route{database="console",user="console"} 0
-odyssey_server_pool_connections_current_route{database="postgres",user="postgres"} 16
 odyssey_server_pool_capacity_configured_route{database="console",user="console"} 0
 odyssey_server_pool_capacity_configured_route{database="postgres",user="postgres"} 16
 odyssey_server_pool_state_route{database="console",state="active",user="console"} 0
@@ -55,11 +51,3 @@ odyssey_server_pool_state_route{database="postgres",state="idle",user="postgres"
 odyssey_server_pool_state_route{database="postgres",state="login",user="postgres"} 0
 odyssey_server_pool_state_route{database="postgres",state="tested",user="postgres"} 0
 odyssey_server_pool_state_route{database="postgres",state="used",user="postgres"} 0
-odyssey_server_pool_idle_route{database="console",user="console"} 0
-odyssey_server_pool_idle_route{database="postgres",user="postgres"} 16
-odyssey_server_pool_login_route{database="console",user="console"} 0
-odyssey_server_pool_login_route{database="postgres",user="postgres"} 0
-odyssey_server_pool_tested_route{database="console",user="console"} 0
-odyssey_server_pool_tested_route{database="postgres",user="postgres"} 0
-odyssey_server_pool_used_route{database="console",user="console"} 0
-odyssey_server_pool_used_route{database="postgres",user="postgres"} 0

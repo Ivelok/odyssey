@@ -81,47 +81,14 @@ var (
 		[]string{"user", "database"}, nil,
 	)
 
-	serverPoolActiveRouteDescription = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "server_pool", "active_route"),
-		"Active backend connections for a specific route",
-		[]string{"user", "database"}, nil,
-	)
+	    serverPoolCapacityConfiguredRouteDescription = prometheus.NewDesc(
+	        prometheus.BuildFQName(namespace, "server_pool", "capacity_configured_route"),
+	        "Configured server pool capacity for a specific route (0 means unlimited)",
+	        []string{"user", "database"}, nil,
+	    )
 
-	serverPoolIdleRouteDescription = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "server_pool", "idle_route"),
-		"Idle backend connections kept warm for a specific route",
-		[]string{"user", "database"}, nil,
-	)
 
-    serverPoolCapacityConfiguredRouteDescription = prometheus.NewDesc(
-        prometheus.BuildFQName(namespace, "server_pool", "capacity_configured_route"),
-        "Configured server pool capacity for a specific route (0 means unlimited)",
-        []string{"user", "database"}, nil,
-    )
 
-    serverPoolConnectionsCurrentRouteDescription = prometheus.NewDesc(
-        prometheus.BuildFQName(namespace, "server_pool", "connections_current_route"),
-        "Currently open backend connections for the route (sv_active + sv_idle)",
-        []string{"user", "database"}, nil,
-    )
-
-	serverPoolUsedRouteDescription = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "server_pool", "used_route"),
-		"Server connections currently used for the route",
-		[]string{"user", "database"}, nil,
-	)
-
-	serverPoolTestedRouteDescription = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "server_pool", "tested_route"),
-		"Server connections in testing state for the route",
-		[]string{"user", "database"}, nil,
-	)
-
-	serverPoolLoginRouteDescription = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "server_pool", "login_route"),
-		"Server connections performing login for the route",
-		[]string{"user", "database"}, nil,
-	)
 
 	clientPoolMaxwaitSecondsRouteDescription = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "client_pool", "maxwait_seconds_route"),
@@ -249,26 +216,15 @@ type poolColumnMetricDesc struct {
 }
 
 var poolsExtendedColumnToMetric = map[string]poolColumnMetricDesc{
-	"cl_active": {
-		desc:      clientPoolActiveRouteDescription,
-		valueType: prometheus.GaugeValue,
-	},
-	"cl_waiting": {
-		desc:      clientPoolWaitingRouteDescription,
-		valueType: prometheus.GaugeValue,
-	},
-	"sv_used": {
-		desc:      serverPoolUsedRouteDescription,
-		valueType: prometheus.GaugeValue,
-	},
-	"sv_tested": {
-		desc:      serverPoolTestedRouteDescription,
-		valueType: prometheus.GaugeValue,
-	},
-	"sv_login": {
-		desc:      serverPoolLoginRouteDescription,
-		valueType: prometheus.GaugeValue,
-	},
+		"cl_active": {
+			desc:      clientPoolActiveRouteDescription,
+			valueType: prometheus.GaugeValue,
+		},
+		"cl_waiting": {
+			desc:      clientPoolWaitingRouteDescription,
+			valueType: prometheus.GaugeValue,
+		},
+
     "maxwait": {
         desc:      clientPoolMaxwaitSecondsRouteDescription,
         valueType: prometheus.GaugeValue,
@@ -294,6 +250,12 @@ var serverPoolStateRouteDescription = prometheus.NewDesc(
     "Server pool state per route",
     []string{"user", "database", "state"}, nil,
 )
+
+// routeKey identifies a route by backend database and user
+type routeKey struct {
+    database string
+    user     string
+}
 
 func NewExporter(connectionString string, logger *slog.Logger) (*Exporter, error) {
 	connector, err := pq.NewConnector(connectionString)
@@ -397,7 +359,7 @@ func (exporter *Exporter) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[string]float64, error) {
+func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[routeKey]float64, error) {
     rows, err := db.Query(showDatabasesCommand)
     if err != nil {
         return nil, fmt.Errorf("error getting databases: %w", err)
@@ -410,21 +372,28 @@ func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[string]flo
 	}
 
 	nameIdx := -1
+	dbIdx := -1
+	userIdx := -1
 	poolSizeIdx := -1
 	for idx, name := range columns {
 		switch name {
 		case "name":
 			nameIdx = idx
+		case "database":
+			dbIdx = idx
+		case "force_user":
+			userIdx = idx
 		case "pool_size":
 			poolSizeIdx = idx
 		}
 	}
 
-	if nameIdx == -1 || poolSizeIdx == -1 {
+	// require pool_size and at least one database column
+	if poolSizeIdx == -1 || (dbIdx == -1 && nameIdx == -1) {
 		return nil, fmt.Errorf("unexpected databases output format")
 	}
 
-    result := make(map[string]float64)
+    result := make(map[routeKey]float64)
 
 	rawColumns := make([]sql.RawBytes, len(columns))
 	dest := make([]interface{}, len(columns))
@@ -442,8 +411,15 @@ func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[string]flo
 		}
 
 		backendDatabase := ""
-		if rawColumns[nameIdx] != nil {
+		if dbIdx != -1 && rawColumns[dbIdx] != nil {
+			backendDatabase = string(rawColumns[dbIdx])
+		} else if nameIdx != -1 && rawColumns[nameIdx] != nil {
 			backendDatabase = string(rawColumns[nameIdx])
+		}
+
+		backendUser := ""
+		if userIdx != -1 && rawColumns[userIdx] != nil {
+			backendUser = string(rawColumns[userIdx])
 		}
 
 		poolSizeValue := 0.0
@@ -457,7 +433,7 @@ func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[string]flo
 			}
 		}
 
-        result[backendDatabase] = poolSizeValue
+        result[routeKey{database: backendDatabase, user: backendUser}] = poolSizeValue
 	}
 
 	if err := rows.Err(); err != nil {
@@ -705,7 +681,7 @@ func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.
 	return rows.Err()
 }
 
-func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, db *sql.DB, capacities map[string]float64) error {
+func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, db *sql.DB, capacities map[routeKey]float64) error {
 	rows, err := db.Query(showPoolsExtendedCommand)
 	if err != nil {
 		return fmt.Errorf("error getting pools: %w", err)
@@ -748,8 +724,6 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
 
         serverActive := 0.0
         serverIdle := 0.0
-        hasServerActive := false
-        hasServerIdle := false
         serverUsed := 0.0
         serverTested := 0.0
         serverLogin := 0.0
@@ -814,11 +788,9 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
             switch columnName {
             case "sv_active":
                 serverActive = value
-                hasServerActive = true
                 continue
             case "sv_idle":
                 serverIdle = value
-                hasServerIdle = true
                 continue
             case "sv_used":
                 serverUsed = value
@@ -847,25 +819,16 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
             return fmt.Errorf("got unexpected column %q", columnName)
         }
 
-        if hasServerActive {
-            ch <- prometheus.MustNewConstMetric(
-                serverPoolActiveRouteDescription,
-                prometheus.GaugeValue,
-                serverActive,
-                user, database,
-            )
-        }
-        if hasServerIdle {
-            ch <- prometheus.MustNewConstMetric(
-                serverPoolIdleRouteDescription,
-                prometheus.GaugeValue,
-                serverIdle,
-                user, database,
-            )
-        }
+        // Per-state values are available via the unified family below
 
         // Always export configured capacity (0 means unlimited) based on SHOW DATABASES
-        configuredCapacity := capacities[database]
+        // Prefer exact database+user match; fall back to database-only if present
+        var configuredCapacity float64
+        if v, ok := capacities[routeKey{database: database, user: user}]; ok {
+            configuredCapacity = v
+        } else if v, ok := capacities[routeKey{database: database, user: ""}]; ok {
+            configuredCapacity = v
+        }
         ch <- prometheus.MustNewConstMetric(
             serverPoolCapacityConfiguredRouteDescription,
             prometheus.GaugeValue,
@@ -873,14 +836,7 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
             user, database,
         )
 
-        // Export current connections = sv_active + sv_idle
-        currentConnections := serverActive + serverIdle
-        ch <- prometheus.MustNewConstMetric(
-            serverPoolConnectionsCurrentRouteDescription,
-            prometheus.GaugeValue,
-            currentConnections,
-            user, database,
-        )
+        // Current connections can be derived as active+idle from the unified state family
 
         // Unified state metric family
         ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverActive, user, database, "active")
