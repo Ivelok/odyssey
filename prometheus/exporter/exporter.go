@@ -93,11 +93,17 @@ var (
 		[]string{"user", "database"}, nil,
 	)
 
-	serverPoolCapacityRouteDescription = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "server_pool", "capacity_route"),
-		"Configured server pool capacity for a specific route",
-		[]string{"user", "database"}, nil,
-	)
+    serverPoolCapacityConfiguredRouteDescription = prometheus.NewDesc(
+        prometheus.BuildFQName(namespace, "server_pool", "capacity_configured_route"),
+        "Configured server pool capacity for a specific route (0 means unlimited)",
+        []string{"user", "database"}, nil,
+    )
+
+    serverPoolConnectionsCurrentRouteDescription = prometheus.NewDesc(
+        prometheus.BuildFQName(namespace, "server_pool", "connections_current_route"),
+        "Currently open backend connections for the route (sv_active + sv_idle)",
+        []string{"user", "database"}, nil,
+    )
 
 	serverPoolUsedRouteDescription = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "server_pool", "used_route"),
@@ -123,13 +129,9 @@ var (
 		[]string{"user", "database"}, nil,
 	)
 
-	clientPoolMaxwaitMicrosecondsRouteDescription = prometheus.NewDesc(
-		prometheus.BuildFQName(namespace, "client_pool", "maxwait_microseconds_route"),
-		"Maximum observed wait time for clients on the route (microseconds)",
-		[]string{"user", "database"}, nil,
-	)
+    // Deprecated: we no longer export microseconds variant
 
-	routePoolModeInfoDescription = prometheus.NewDesc(
+    routePoolModeInfoDescription = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "route", "pool_mode_info"),
 		"Pool mode information for the route",
 		[]string{"user", "database", "mode"}, nil,
@@ -267,32 +269,31 @@ var poolsExtendedColumnToMetric = map[string]poolColumnMetricDesc{
 		desc:      serverPoolLoginRouteDescription,
 		valueType: prometheus.GaugeValue,
 	},
-	"maxwait": {
-		desc:      clientPoolMaxwaitSecondsRouteDescription,
-		valueType: prometheus.GaugeValue,
-	},
-	"maxwait_us": {
-		desc:      clientPoolMaxwaitMicrosecondsRouteDescription,
-		valueType: prometheus.GaugeValue,
-	},
+    "maxwait": {
+        desc:      clientPoolMaxwaitSecondsRouteDescription,
+        valueType: prometheus.GaugeValue,
+    },
+    // "maxwait_us" is intentionally ignored to avoid duplicate metrics
 	"bytes_received": {
 		desc:      routeBytesReceivedTotalDescription,
 		valueType: prometheus.CounterValue,
 	},
-	"bytes_sent": {
-		desc:      routeBytesSentTotalDescription,
-		valueType: prometheus.CounterValue,
-	},
+    "bytes_sent": {
+        desc:      routeBytesSentTotalDescription,
+        valueType: prometheus.CounterValue,
+    },
 	"tcp_conn_count": {
 		desc:      routeTCPConnectionsTotalDescription,
 		valueType: prometheus.CounterValue,
 	},
 }
 
-type routeCapacity struct {
-	database string
-	value    float64
-}
+// unified state metric for server pool
+var serverPoolStateRouteDescription = prometheus.NewDesc(
+    prometheus.BuildFQName(namespace, "server_pool", "state_route"),
+    "Server pool state per route",
+    []string{"user", "database", "state"}, nil,
+)
 
 func NewExporter(connectionString string, logger *slog.Logger) (*Exporter, error) {
 	connector, err := pq.NewConnector(connectionString)
@@ -396,12 +397,12 @@ func (exporter *Exporter) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) ([]routeCapacity, error) {
-	rows, err := db.Query(showDatabasesCommand)
-	if err != nil {
-		return nil, fmt.Errorf("error getting databases: %w", err)
-	}
-	defer rows.Close()
+func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[string]float64, error) {
+    rows, err := db.Query(showDatabasesCommand)
+    if err != nil {
+        return nil, fmt.Errorf("error getting databases: %w", err)
+    }
+    defer rows.Close()
 
 	columns, err := rows.Columns()
 	if err != nil {
@@ -423,7 +424,7 @@ func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) ([]routeCapacit
 		return nil, fmt.Errorf("unexpected databases output format")
 	}
 
-	var result []routeCapacity
+    result := make(map[string]float64)
 
 	rawColumns := make([]sql.RawBytes, len(columns))
 	dest := make([]interface{}, len(columns))
@@ -456,17 +457,14 @@ func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) ([]routeCapacit
 			}
 		}
 
-		result = append(result, routeCapacity{
-			database: backendDatabase,
-			value:    poolSizeValue,
-		})
+        result[backendDatabase] = poolSizeValue
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating databases rows: %w", err)
 	}
 
-	return result, nil
+    return result, nil
 }
 
 func (*Exporter) sendVersionMetric(ch chan<- prometheus.Metric, db *sql.DB) error {
@@ -707,7 +705,7 @@ func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.
 	return rows.Err()
 }
 
-func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, db *sql.DB, capacities []routeCapacity) error {
+func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, db *sql.DB, capacities map[string]float64) error {
 	rows, err := db.Query(showPoolsExtendedCommand)
 	if err != nil {
 		return fmt.Errorf("error getting pools: %w", err)
@@ -722,8 +720,7 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
 		return fmt.Errorf("invalid format of pools output")
 	}
 
-	capIdx := 0
-	for rows.Next() {
+    for rows.Next() {
 		vals := make([]interface{}, len(columns))
 		for i := range vals {
 			vals[i] = new(interface{})
@@ -749,10 +746,13 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
 			continue
 		}
 
-		serverActive := 0.0
-		serverIdle := 0.0
-		hasServerActive := false
-		hasServerIdle := false
+        serverActive := 0.0
+        serverIdle := 0.0
+        hasServerActive := false
+        hasServerIdle := false
+        serverUsed := 0.0
+        serverTested := 0.0
+        serverLogin := 0.0
 
 		for i := 2; i < len(columns); i++ {
 			columnName := columns[i]
@@ -776,12 +776,12 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
 				continue
 			}
 
-			if strings.HasPrefix(columnName, queryQuantilePrefix) {
-				value, _, err := extractFloat(val, columnName)
-				if err != nil {
-					return err
-				}
-				quantile := strings.TrimPrefix(columnName, queryQuantilePrefix)
+            if strings.HasPrefix(columnName, queryQuantilePrefix) {
+                value, _, err := extractFloat(val, columnName)
+                if err != nil {
+                    return err
+                }
+                quantile := strings.TrimPrefix(columnName, queryQuantilePrefix)
 				ch <- prometheus.MustNewConstMetric(
 					routeQueryDurationSecondsDescription,
 					prometheus.GaugeValue,
@@ -791,12 +791,12 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
 				continue
 			}
 
-			if strings.HasPrefix(columnName, transactionQuantilePrefix) {
-				value, _, err := extractFloat(val, columnName)
-				if err != nil {
-					return err
-				}
-				quantile := strings.TrimPrefix(columnName, transactionQuantilePrefix)
+            if strings.HasPrefix(columnName, transactionQuantilePrefix) {
+                value, _, err := extractFloat(val, columnName)
+                if err != nil {
+                    return err
+                }
+                quantile := strings.TrimPrefix(columnName, transactionQuantilePrefix)
 				ch <- prometheus.MustNewConstMetric(
 					routeTransactionDurationSecondsDescription,
 					prometheus.GaugeValue,
@@ -806,73 +806,91 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
 				continue
 			}
 
-			value, _, err := extractFloat(val, columnName)
-			if err != nil {
-				return err
-			}
+            value, _, err := extractFloat(val, columnName)
+            if err != nil {
+                return err
+            }
 
-			switch columnName {
-			case "sv_active":
-				serverActive = value
-				hasServerActive = true
-				continue
-			case "sv_idle":
-				serverIdle = value
-				hasServerIdle = true
-				continue
-			}
+            switch columnName {
+            case "sv_active":
+                serverActive = value
+                hasServerActive = true
+                continue
+            case "sv_idle":
+                serverIdle = value
+                hasServerIdle = true
+                continue
+            case "sv_used":
+                serverUsed = value
+                // do not continue, let mapping below export per-state metric too
+            case "sv_tested":
+                serverTested = value
+            case "sv_login":
+                serverLogin = value
+            }
 
-			if metricDesc, ok := poolsExtendedColumnToMetric[columnName]; ok {
-				ch <- prometheus.MustNewConstMetric(
-					metricDesc.desc,
-					metricDesc.valueType,
-					value,
-					user, database,
-				)
-				continue
-			}
+            // Ignore deprecated microseconds column silently
+            if columnName == "maxwait_us" {
+                continue
+            }
 
-			return fmt.Errorf("got unexpected column %q", columnName)
-		}
+            if metricDesc, ok := poolsExtendedColumnToMetric[columnName]; ok {
+                ch <- prometheus.MustNewConstMetric(
+                    metricDesc.desc,
+                    metricDesc.valueType,
+                    value,
+                    user, database,
+                )
+                continue
+            }
 
-		if hasServerActive {
-			ch <- prometheus.MustNewConstMetric(
-				serverPoolActiveRouteDescription,
-				prometheus.GaugeValue,
-				serverActive,
-				user, database,
-			)
-		}
-		if hasServerIdle {
-			ch <- prometheus.MustNewConstMetric(
-				serverPoolIdleRouteDescription,
-				prometheus.GaugeValue,
-				serverIdle,
-				user, database,
-			)
-		}
+            return fmt.Errorf("got unexpected column %q", columnName)
+        }
 
-		if hasServerActive || hasServerIdle {
-			capacity := 0.0
-			if capIdx < len(capacities) {
-				capacity = capacities[capIdx].value
-				capIdx++
-			}
-			if capacity <= 0 {
-				capacity = serverActive + serverIdle
-			}
-			if capacity > 0 {
-				ch <- prometheus.MustNewConstMetric(
-					serverPoolCapacityRouteDescription,
-					prometheus.GaugeValue,
-					capacity,
-					user, database,
-				)
-			}
-		}
-	}
+        if hasServerActive {
+            ch <- prometheus.MustNewConstMetric(
+                serverPoolActiveRouteDescription,
+                prometheus.GaugeValue,
+                serverActive,
+                user, database,
+            )
+        }
+        if hasServerIdle {
+            ch <- prometheus.MustNewConstMetric(
+                serverPoolIdleRouteDescription,
+                prometheus.GaugeValue,
+                serverIdle,
+                user, database,
+            )
+        }
 
-	return nil
+        // Always export configured capacity (0 means unlimited) based on SHOW DATABASES
+        configuredCapacity := capacities[database]
+        ch <- prometheus.MustNewConstMetric(
+            serverPoolCapacityConfiguredRouteDescription,
+            prometheus.GaugeValue,
+            configuredCapacity,
+            user, database,
+        )
+
+        // Export current connections = sv_active + sv_idle
+        currentConnections := serverActive + serverIdle
+        ch <- prometheus.MustNewConstMetric(
+            serverPoolConnectionsCurrentRouteDescription,
+            prometheus.GaugeValue,
+            currentConnections,
+            user, database,
+        )
+
+        // Unified state metric family
+        ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverActive, user, database, "active")
+        ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverIdle, user, database, "idle")
+        ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverUsed, user, database, "used")
+        ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverTested, user, database, "tested")
+        ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverLogin, user, database, "login")
+    }
+
+    return nil
 }
 
 func main() {

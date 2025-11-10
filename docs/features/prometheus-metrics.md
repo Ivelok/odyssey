@@ -1,6 +1,6 @@
 # Prometheus metrics
 
-This section describes a ways to export Odyssey metrics in Prometheus format.
+This section describes ways to export Odyssey metrics in Prometheus format.
 
 ----
 
@@ -43,7 +43,8 @@ The Go-based exporter scrapes `SHOW POOLS_EXTENDED;` and `SHOW DATABASES;` and n
 | `odyssey_client_pool_active_route` | `user`, `database` | Gauge | Clients currently using the route. |
 | `odyssey_client_pool_waiting_route` | `user`, `database` | Gauge | Clients blocked waiting for a server connection. |
 | `odyssey_client_pool_maxwait_seconds_route` | `user`, `database` | Gauge | Maximum observed wait in seconds. |
-| `odyssey_client_pool_maxwait_microseconds_route` | `user`, `database` | Gauge | Same measurement with microsecond precision. |
+| `odyssey_server_pool_connections_current_route` | `user`, `database` | Gauge | Current backend connections (`sv_active + sv_idle`). |
+| `odyssey_server_pool_capacity_configured_route` | `user`, `database` | Gauge | Configured `pool_size` from `SHOW DATABASES` (`0` means unlimited). |
 | `odyssey_route_pool_mode_info` | `user`, `database`, `mode` | Gauge | `1` for the active pool mode (`session`, `transaction`, `statement`). |
 | `odyssey_route_bytes_received_total` | `user`, `database` | Counter | Bytes received from clients on the route. |
 | `odyssey_route_bytes_sent_total` | `user`, `database` | Counter | Bytes sent to PostgreSQL backends. |
@@ -55,15 +56,21 @@ The Go-based exporter scrapes `SHOW POOLS_EXTENDED;` and `SHOW DATABASES;` and n
 | `odyssey_server_pool_used_route` | `user`, `database` | Gauge | Connections recently used and waiting for reuse. |
 | `odyssey_server_pool_tested_route` | `user`, `database` | Gauge | Connections undergoing health checks. |
 | `odyssey_server_pool_login_route` | `user`, `database` | Gauge | Connections currently authenticating. |
-| `odyssey_server_pool_capacity_route` | `user`, `database` | Gauge | Configured `pool_size` (fallback to `sv_active + sv_idle` when unlimited). |
+| `odyssey_server_pool_state_route` | `user`, `database`, `state` | Gauge | Unified state family; one sample per `state` in `active|idle|used|tested|login`. |
 
-Saturation can still be tracked by comparing gauges, for example:
+Saturation examples:
 
 ```
-odyssey_server_pool_active_route / odyssey_server_pool_capacity_route
+odyssey_server_pool_active_route / ignoring(state) odyssey_server_pool_capacity_configured_route
 ```
 
-Values close to `1` indicate the route is exhausting its server quota. Quantile metrics expose the instantaneous TDigest estimate, so alerting thresholds should be treated like gauges (e.g., `odyssey_route_query_duration_seconds{quantile="0.95"} > 0.5`).
+If `capacity_configured_route == 0` (unlimited), prefer absolute values or observed load instead of ratios:
+
+```
+odyssey_server_pool_connections_current_route
+```
+
+Quantiles (`*_duration_seconds`) are instantaneous TDigest estimates; treat thresholds like gauges (for example, `odyssey_route_query_duration_seconds{quantile="0.95"} > 0.5`).
 
 ## Database-level averages
 
