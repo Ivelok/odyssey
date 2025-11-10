@@ -67,9 +67,10 @@ Values close to `1` indicate the route is exhausting its server quota. Quantile 
 
 ## Database-level averages
 
-Odyssey’s cron thread still computes the historical averages that fed the legacy Prometheus endpoint. The Go exporter re-exposes the most in-demand gauge:
+Odyssey’s cron thread still computes the historical averages that fed the legacy Prometheus endpoint. The Go exporter re-exposes the most in-demand gauges:
 
-- `odyssey_database_avg_tx_per_second{database="<db>"}` — average transactions per second observed over the most recent `stats_interval` window for that database.
+- `odyssey_database_avg_tx_per_second{database="<db>"}` — average transactions per second observed over the most recent `stats_interval` window.
+- `odyssey_database_avg_query_per_second{database="<db>"}` — same concept for queries (per-second throughput).
 
 ## Error counters
 

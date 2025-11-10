@@ -63,6 +63,12 @@ var (
 		[]string{"database"}, nil,
 	)
 
+	avgQueryCountDescription = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "database", "avg_query_per_second"),
+		"Average number of queries per second reported by Odyssey cron",
+		[]string{"database"}, nil,
+	)
+
 	clientPoolActiveRouteDescription = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "client_pool", "active_route"),
 		"Active clients currently using the route",
@@ -629,17 +635,20 @@ func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.
 
 	databaseIdx := -1
 	avgXactIdx := -1
+	avgQueryIdx := -1
 	for idx, name := range columns {
 		switch name {
 		case "database":
 			databaseIdx = idx
 		case "avg_xact_count":
 			avgXactIdx = idx
+		case "avg_query_count":
+			avgQueryIdx = idx
 		}
 	}
 
-	if databaseIdx == -1 || avgXactIdx == -1 {
-		return fmt.Errorf("unexpected stats columns, database=%d avg_xact_count=%d", databaseIdx, avgXactIdx)
+	if databaseIdx == -1 || avgXactIdx == -1 || avgQueryIdx == -1 {
+		return fmt.Errorf("unexpected stats columns, database=%d avg_xact_count=%d avg_query_count=%d", databaseIdx, avgXactIdx, avgQueryIdx)
 	}
 
 	rawColumns := make([]sql.RawBytes, len(columns))
@@ -664,18 +673,33 @@ func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.
 			continue
 		}
 
-		avgValue := 0.0
+		avgTxValue := 0.0
 		if rawColumns[avgXactIdx] != nil {
-			avgValue, err = strconv.ParseFloat(string(rawColumns[avgXactIdx]), 64)
+			avgTxValue, err = strconv.ParseFloat(string(rawColumns[avgXactIdx]), 64)
 			if err != nil {
 				return fmt.Errorf("can't parse avg_xact_count for %s: %w", database, err)
+			}
+		}
+
+		avgQueryValue := 0.0
+		if rawColumns[avgQueryIdx] != nil {
+			avgQueryValue, err = strconv.ParseFloat(string(rawColumns[avgQueryIdx]), 64)
+			if err != nil {
+				return fmt.Errorf("can't parse avg_query_count for %s: %w", database, err)
 			}
 		}
 
 		ch <- prometheus.MustNewConstMetric(
 			avgTxCountDescription,
 			prometheus.GaugeValue,
-			avgValue,
+			avgTxValue,
+			database,
+		)
+
+		ch <- prometheus.MustNewConstMetric(
+			avgQueryCountDescription,
+			prometheus.GaugeValue,
+			avgQueryValue,
 			database,
 		)
 	}
