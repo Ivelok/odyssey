@@ -22,6 +22,8 @@ Flags:
   -h, --[no-]help                Show context-sensitive help (also try --help-long and --help-man).
       --odyssey.connectionString="host=localhost port=6432 user=console dbname=console sslmode=disable"  
                                  Connection string for accessing Odyssey.
+      --odyssey.scrape-timeout=5s
+                                 Maximum duration for a single `/metrics` scrape (inherits the HTTP request context; use 0s to disable).
       --[no-]web.systemd-socket  Use systemd socket activation listeners instead of port listeners (Linux only).
       --web.listen-address=:9876 ...  
                                  Addresses on which to expose metrics and web interface. Repeatable for multiple addresses. Examples: `:9100` or `[::1]:9100` for http,
@@ -33,6 +35,8 @@ Flags:
 
 Currently in developing stage, so if you have any troubles
 with this exporter, please, [contact us](../about/contributing.md).
+
+Each `/metrics` request now inherits the HTTP context and uses `--odyssey.scrape-timeout` (default `5s`) to bound how long the exporter waits for `SHOW ...` commands. If the timeout or client cancellation fires, outstanding queries are aborted and the scrape returns `odyssey_exporter_up 0` along with any metrics collected before the interruption.
 
 ## Route-level metrics
 

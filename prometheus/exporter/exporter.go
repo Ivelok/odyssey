@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -111,14 +112,11 @@ var (
 		[]string{"user", "database"}, nil,
 	)
 
-	    serverPoolCapacityConfiguredRouteDescription = prometheus.NewDesc(
-	        prometheus.BuildFQName(namespace, "server_pool", "capacity_configured_route"),
-	        "Configured server pool capacity for a specific route (0 means unlimited)",
-	        []string{"user", "database"}, nil,
-	    )
-
-
-
+	serverPoolCapacityConfiguredRouteDescription = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "server_pool", "capacity_configured_route"),
+		"Configured server pool capacity for a specific route (0 means unlimited)",
+		[]string{"user", "database"}, nil,
+	)
 
 	clientPoolMaxwaitSecondsRouteDescription = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "client_pool", "maxwait_seconds_route"),
@@ -126,9 +124,9 @@ var (
 		[]string{"user", "database"}, nil,
 	)
 
-    // Deprecated: we no longer export microseconds variant
+	// Deprecated: we no longer export microseconds variant
 
-    routePoolModeInfoDescription = prometheus.NewDesc(
+	routePoolModeInfoDescription = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "route", "pool_mode_info"),
 		"Pool mode information for the route",
 		[]string{"user", "database", "mode"}, nil,
@@ -205,6 +203,31 @@ var (
 			prometheus.BuildFQName(namespace, "lists", "in_flight_dns_queries"),
 			"Count of in-flight DNS queries", nil, nil),
 	}
+
+	describeMetricDescs = []*prometheus.Desc{
+		versionDescription,
+		exporterUpDescription,
+		isPausedDescription,
+		avgTxCountDescription,
+		avgQueryCountDescription,
+		avgRecvBytesPerSecondDescription,
+		avgSentBytesPerSecondDescription,
+		avgXactTimeSecondsDescription,
+		avgQueryTimeSecondsDescription,
+		avgWaitTimeSecondsDescription,
+		clientPoolActiveRouteDescription,
+		clientPoolWaitingRouteDescription,
+		serverPoolCapacityConfiguredRouteDescription,
+		clientPoolMaxwaitSecondsRouteDescription,
+		routePoolModeInfoDescription,
+		routeBytesReceivedTotalDescription,
+		routeBytesSentTotalDescription,
+		routeTCPConnectionsTotalDescription,
+		routeQueryDurationSecondsDescription,
+		routeTransactionDurationSecondsDescription,
+		errorsTotalDescription,
+		serverPoolStateRouteDescription,
+	}
 )
 
 func writePoolModeInfoMetric(ch chan<- prometheus.Metric, database, user, mode string) {
@@ -235,9 +258,39 @@ func extractFloat(val interface{}, columnName string) (float64, bool, error) {
 	}
 }
 
+func extractString(val interface{}, columnName string) (string, error) {
+	switch v := val.(type) {
+	case string:
+		return v, nil
+	case []byte:
+		return string(v), nil
+	case sql.RawBytes:
+		return string(v), nil
+	case fmt.Stringer:
+		return v.String(), nil
+	case nil:
+		return "", fmt.Errorf("column %q is NULL, expected string", columnName)
+	default:
+		return "", fmt.Errorf("expected column %q to be string, got %T", columnName, val)
+	}
+}
+
 type Exporter struct {
 	connector *pq.Connector
 	logger    *slog.Logger
+}
+
+type contextCollector struct {
+	exporter *Exporter
+	ctx      context.Context
+}
+
+func (c *contextCollector) Describe(ch chan<- *prometheus.Desc) {
+	c.exporter.Describe(ch)
+}
+
+func (c *contextCollector) Collect(ch chan<- prometheus.Metric) {
+	c.exporter.collectWithContext(c.ctx, ch)
 }
 
 type poolColumnMetricDesc struct {
@@ -246,28 +299,28 @@ type poolColumnMetricDesc struct {
 }
 
 var poolsExtendedColumnToMetric = map[string]poolColumnMetricDesc{
-		"cl_active": {
-			desc:      clientPoolActiveRouteDescription,
-			valueType: prometheus.GaugeValue,
-		},
-		"cl_waiting": {
-			desc:      clientPoolWaitingRouteDescription,
-			valueType: prometheus.GaugeValue,
-		},
+	"cl_active": {
+		desc:      clientPoolActiveRouteDescription,
+		valueType: prometheus.GaugeValue,
+	},
+	"cl_waiting": {
+		desc:      clientPoolWaitingRouteDescription,
+		valueType: prometheus.GaugeValue,
+	},
 
-    "maxwait": {
-        desc:      clientPoolMaxwaitSecondsRouteDescription,
-        valueType: prometheus.GaugeValue,
-    },
-    // "maxwait_us" is intentionally ignored to avoid duplicate metrics
+	"maxwait": {
+		desc:      clientPoolMaxwaitSecondsRouteDescription,
+		valueType: prometheus.GaugeValue,
+	},
+	// "maxwait_us" is intentionally ignored to avoid duplicate metrics
 	"bytes_received": {
 		desc:      routeBytesReceivedTotalDescription,
 		valueType: prometheus.CounterValue,
 	},
-    "bytes_sent": {
-        desc:      routeBytesSentTotalDescription,
-        valueType: prometheus.CounterValue,
-    },
+	"bytes_sent": {
+		desc:      routeBytesSentTotalDescription,
+		valueType: prometheus.CounterValue,
+	},
 	"tcp_conn_count": {
 		desc:      routeTCPConnectionsTotalDescription,
 		valueType: prometheus.CounterValue,
@@ -276,15 +329,22 @@ var poolsExtendedColumnToMetric = map[string]poolColumnMetricDesc{
 
 // unified state metric for server pool
 var serverPoolStateRouteDescription = prometheus.NewDesc(
-    prometheus.BuildFQName(namespace, "server_pool", "state_route"),
-    "Server pool state per route",
-    []string{"user", "database", "state"}, nil,
+	prometheus.BuildFQName(namespace, "server_pool", "state_route"),
+	"Server pool state per route",
+	[]string{"user", "database", "state"}, nil,
 )
 
 // routeKey identifies a route by backend database and user
 type routeKey struct {
-    database string
-    user     string
+	database string
+	user     string
+}
+
+type rowIterator interface {
+	Columns() ([]string, error)
+	Next() bool
+	Scan(dest ...interface{}) error
+	Err() error
 }
 
 func NewExporter(connectionString string, logger *slog.Logger) (*Exporter, error) {
@@ -300,20 +360,13 @@ func NewExporter(connectionString string, logger *slog.Logger) (*Exporter, error
 }
 
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
-	// TODO: do not collect metrics here ?
-	metricCh := make(chan prometheus.Metric)
-	doneCh := make(chan struct{})
+	for _, desc := range describeMetricDescs {
+		ch <- desc
+	}
 
-	go func() {
-		for m := range metricCh {
-			ch <- m.Desc()
-		}
-		close(doneCh)
-	}()
-
-	e.Collect(metricCh)
-	close(metricCh)
-	<-doneCh
+	for _, desc := range listMetricNameToDescription {
+		ch <- desc
+	}
 }
 
 func (exporter *Exporter) getDB() (*sql.DB, error) {
@@ -329,6 +382,10 @@ func (exporter *Exporter) getDB() (*sql.DB, error) {
 }
 
 func (exporter *Exporter) Collect(ch chan<- prometheus.Metric) {
+	exporter.collectWithContext(context.Background(), ch)
+}
+
+func (exporter *Exporter) collectWithContext(ctx context.Context, ch chan<- prometheus.Metric) {
 	logger := exporter.logger
 
 	var up = 1.0
@@ -345,56 +402,56 @@ func (exporter *Exporter) Collect(ch chan<- prometheus.Metric) {
 	}
 	defer db.Close()
 
-	if err = exporter.sendVersionMetric(ch, db); err != nil {
-		logger.Error("can't get version", "err", err.Error())
+	if err := exporter.collectWithDB(ctx, ch, db); err != nil {
+		logger.Error("scrape failed", "err", err)
 		up = 0
-		return
-	}
-
-	if err = exporter.sendListsMetrics(ch, db); err != nil {
-		logger.Error("can't get lists metrics", "err", err.Error())
-		up = 0
-		return
-	}
-
-	if err = exporter.sendIsPausedMetric(ch, db); err != nil {
-		logger.Error("can't get is_pause metric", "err", err.Error())
-		up = 0
-		return
-	}
-
-	if err = exporter.sendErrorMetrics(ch, db); err != nil {
-		logger.Error("can't get error metrics", "err", err.Error())
-		up = 0
-		return
-	}
-
-	if err = exporter.sendStatsMetrics(ch, db); err != nil {
-		logger.Error("can't get stats metrics", "err", err.Error())
-		up = 0
-		return
-	}
-
-	poolCapacities, err := exporter.collectRoutePoolCapacities(db)
-	if err != nil {
-		logger.Error("can't get pool capacity", "err", err.Error())
-		up = 0
-		return
-	}
-
-	if err = exporter.sendPoolsExtendedMetrics(ch, db, poolCapacities); err != nil {
-		logger.Error("can't get pool metrics", "err", err.Error())
-		up = 0
-		return
 	}
 }
 
-func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[routeKey]float64, error) {
-    rows, err := db.Query(showDatabasesCommand)
-    if err != nil {
-        return nil, fmt.Errorf("error getting databases: %w", err)
-    }
-    defer rows.Close()
+func (exporter *Exporter) collectWithDB(ctx context.Context, ch chan<- prometheus.Metric, db *sql.DB) error {
+	logger := exporter.logger
+
+	var scrapeErr error
+
+	runStep := func(name string, fn func() error) {
+		if fnErr := fn(); fnErr != nil {
+			logger.Error("scrape step failed", "step", name, "err", fnErr)
+			scrapeErr = errors.Join(scrapeErr, fmt.Errorf("%s: %w", name, fnErr))
+		}
+	}
+
+	runStep("version", func() error { return exporter.sendVersionMetric(ctx, ch, db) })
+	runStep("lists", func() error { return exporter.sendListsMetrics(ctx, ch, db) })
+	runStep("is_paused", func() error { return exporter.sendIsPausedMetric(ctx, ch, db) })
+	runStep("errors", func() error { return exporter.sendErrorMetrics(ctx, ch, db) })
+	runStep("stats", func() error { return exporter.sendStatsMetrics(ctx, ch, db) })
+
+	var poolCapacities map[routeKey]float64
+	runStep("databases", func() error {
+		var err error
+		poolCapacities, err = exporter.collectRoutePoolCapacities(ctx, db)
+		return err
+	})
+
+	if poolCapacities == nil {
+		poolCapacities = map[routeKey]float64{}
+	}
+
+	runStep("pools_extended", func() error { return exporter.sendPoolsExtendedMetrics(ctx, ch, db, poolCapacities) })
+
+	if scrapeErr != nil {
+		return scrapeErr
+	}
+
+	return nil
+}
+
+func (exporter *Exporter) collectRoutePoolCapacities(ctx context.Context, db *sql.DB) (map[routeKey]float64, error) {
+	rows, err := db.QueryContext(ctx, showDatabasesCommand)
+	if err != nil {
+		return nil, fmt.Errorf("error getting databases: %w", err)
+	}
+	defer rows.Close()
 
 	columns, err := rows.Columns()
 	if err != nil {
@@ -423,7 +480,7 @@ func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[routeKey]f
 		return nil, fmt.Errorf("unexpected databases output format")
 	}
 
-    result := make(map[routeKey]float64)
+	result := make(map[routeKey]float64)
 
 	rawColumns := make([]sql.RawBytes, len(columns))
 	dest := make([]interface{}, len(columns))
@@ -459,37 +516,37 @@ func (exporter *Exporter) collectRoutePoolCapacities(db *sql.DB) (map[routeKey]f
 			if poolSizeStr != "" {
 				poolSizeValue, err = strconv.ParseFloat(poolSizeStr, 64)
 				if err != nil {
-				return nil, fmt.Errorf("can't parse pool_size for %s: %w", routeName, err)
+					return nil, fmt.Errorf("can't parse pool_size for %s: %w", routeName, err)
+				}
 			}
 		}
-	}
 
-        // Store capacity for exact route+user (by route alias)
-        result[routeKey{database: routeName, user: backendUser}] = poolSizeValue
-        // Also store a route-wide fallback under empty user, prefer the maximum if multiple users exist
-        if existing, ok := result[routeKey{database: routeName, user: ""}]; !ok || poolSizeValue > existing {
-            result[routeKey{database: routeName, user: ""}] = poolSizeValue
-        }
-        // Additionally index by backend database name (SHOW DATABASES "database" column) to handle routes
-        // that may not expose alias consistently across commands in some setups
-        if dbIdx != -1 && rawColumns[dbIdx] != nil {
-            backendDB := string(rawColumns[dbIdx])
-            result[routeKey{database: backendDB, user: backendUser}] = poolSizeValue
-            if existing, ok := result[routeKey{database: backendDB, user: ""}]; !ok || poolSizeValue > existing {
-                result[routeKey{database: backendDB, user: ""}] = poolSizeValue
-            }
-        }
+		// Store capacity for exact route+user (by route alias)
+		result[routeKey{database: routeName, user: backendUser}] = poolSizeValue
+		// Also store a route-wide fallback under empty user, prefer the maximum if multiple users exist
+		if existing, ok := result[routeKey{database: routeName, user: ""}]; !ok || poolSizeValue > existing {
+			result[routeKey{database: routeName, user: ""}] = poolSizeValue
+		}
+		// Additionally index by backend database name (SHOW DATABASES "database" column) to handle routes
+		// that may not expose alias consistently across commands in some setups
+		if dbIdx != -1 && rawColumns[dbIdx] != nil {
+			backendDB := string(rawColumns[dbIdx])
+			result[routeKey{database: backendDB, user: backendUser}] = poolSizeValue
+			if existing, ok := result[routeKey{database: backendDB, user: ""}]; !ok || poolSizeValue > existing {
+				result[routeKey{database: backendDB, user: ""}] = poolSizeValue
+			}
+		}
 	}
 
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating databases rows: %w", err)
 	}
 
-    return result, nil
+	return result, nil
 }
 
-func (*Exporter) sendVersionMetric(ch chan<- prometheus.Metric, db *sql.DB) error {
-	rows, err := db.Query(showVersionCommand)
+func (*Exporter) sendVersionMetric(ctx context.Context, ch chan<- prometheus.Metric, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, showVersionCommand)
 	if err != nil {
 		return fmt.Errorf("error getting version: %w", err)
 	}
@@ -524,8 +581,8 @@ func (*Exporter) sendVersionMetric(ch chan<- prometheus.Metric, db *sql.DB) erro
 	return nil
 }
 
-func (exporter *Exporter) sendIsPausedMetric(ch chan<- prometheus.Metric, db *sql.DB) error {
-	rows, err := db.Query(showIsPausedCommand)
+func (exporter *Exporter) sendIsPausedMetric(ctx context.Context, ch chan<- prometheus.Metric, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, showIsPausedCommand)
 	if err != nil {
 		return fmt.Errorf("error getting is_paused: %w", err)
 	}
@@ -564,8 +621,8 @@ func (exporter *Exporter) sendIsPausedMetric(ch chan<- prometheus.Metric, db *sq
 	return nil
 }
 
-func (exporter *Exporter) sendListsMetrics(ch chan<- prometheus.Metric, db *sql.DB) error {
-	rows, err := db.Query(showListsCommand)
+func (exporter *Exporter) sendListsMetrics(ctx context.Context, ch chan<- prometheus.Metric, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, showListsCommand)
 	if err != nil {
 		return fmt.Errorf("error getting version: %w", err)
 	}
@@ -596,11 +653,15 @@ func (exporter *Exporter) sendListsMetrics(ch chan<- prometheus.Metric, db *sql.
 		}
 	}
 
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating lists rows: %w", err)
+	}
+
 	return nil
 }
 
-func (exporter *Exporter) sendErrorMetrics(ch chan<- prometheus.Metric, db *sql.DB) error {
-	rows, err := db.Query(showErrorsCommand)
+func (exporter *Exporter) sendErrorMetrics(ctx context.Context, ch chan<- prometheus.Metric, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, showErrorsCommand)
 	if err != nil {
 		return fmt.Errorf("error getting errors: %w", err)
 	}
@@ -634,11 +695,15 @@ func (exporter *Exporter) sendErrorMetrics(ch chan<- prometheus.Metric, db *sql.
 		)
 	}
 
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating errors rows: %w", err)
+	}
+
 	return nil
 }
 
-func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.DB) error {
-	rows, err := db.Query(showStatsCommand)
+func (exporter *Exporter) sendStatsMetrics(ctx context.Context, ch chan<- prometheus.Metric, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, showStatsCommand)
 	if err != nil {
 		return fmt.Errorf("error getting stats: %w", err)
 	}
@@ -652,34 +717,34 @@ func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.
 		return fmt.Errorf("stats output has no columns")
 	}
 
-    databaseIdx := -1
-    avgXactIdx := -1
-    avgQueryIdx := -1
-    avgRecvIdx := -1
-    avgSentIdx := -1
-    avgXactTimeIdx := -1
-    avgQueryTimeIdx := -1
-    avgWaitTimeIdx := -1
-    for idx, name := range columns {
-        switch name {
-        case "database":
-            databaseIdx = idx
-        case "avg_xact_count":
-            avgXactIdx = idx
-        case "avg_query_count":
-            avgQueryIdx = idx
-        case "avg_recv":
-            avgRecvIdx = idx
-        case "avg_sent":
-            avgSentIdx = idx
-        case "avg_xact_time":
-            avgXactTimeIdx = idx
-        case "avg_query_time":
-            avgQueryTimeIdx = idx
-        case "avg_wait_time":
-            avgWaitTimeIdx = idx
-        }
-    }
+	databaseIdx := -1
+	avgXactIdx := -1
+	avgQueryIdx := -1
+	avgRecvIdx := -1
+	avgSentIdx := -1
+	avgXactTimeIdx := -1
+	avgQueryTimeIdx := -1
+	avgWaitTimeIdx := -1
+	for idx, name := range columns {
+		switch name {
+		case "database":
+			databaseIdx = idx
+		case "avg_xact_count":
+			avgXactIdx = idx
+		case "avg_query_count":
+			avgQueryIdx = idx
+		case "avg_recv":
+			avgRecvIdx = idx
+		case "avg_sent":
+			avgSentIdx = idx
+		case "avg_xact_time":
+			avgXactTimeIdx = idx
+		case "avg_query_time":
+			avgQueryTimeIdx = idx
+		case "avg_wait_time":
+			avgWaitTimeIdx = idx
+		}
+	}
 
 	if databaseIdx == -1 || avgXactIdx == -1 || avgQueryIdx == -1 {
 		return fmt.Errorf("unexpected stats columns, database=%d avg_xact_count=%d avg_query_count=%d", databaseIdx, avgXactIdx, avgQueryIdx)
@@ -707,65 +772,65 @@ func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.
 			continue
 		}
 
-        avgTxValue := 0.0
-        if rawColumns[avgXactIdx] != nil {
-            avgTxValue, err = strconv.ParseFloat(string(rawColumns[avgXactIdx]), 64)
-            if err != nil {
-                return fmt.Errorf("can't parse avg_xact_count for %s: %w", database, err)
-            }
-        }
+		avgTxValue := 0.0
+		if rawColumns[avgXactIdx] != nil {
+			avgTxValue, err = strconv.ParseFloat(string(rawColumns[avgXactIdx]), 64)
+			if err != nil {
+				return fmt.Errorf("can't parse avg_xact_count for %s: %w", database, err)
+			}
+		}
 
-        avgQueryValue := 0.0
-        if rawColumns[avgQueryIdx] != nil {
-            avgQueryValue, err = strconv.ParseFloat(string(rawColumns[avgQueryIdx]), 64)
-            if err != nil {
-                return fmt.Errorf("can't parse avg_query_count for %s: %w", database, err)
-            }
-        }
+		avgQueryValue := 0.0
+		if rawColumns[avgQueryIdx] != nil {
+			avgQueryValue, err = strconv.ParseFloat(string(rawColumns[avgQueryIdx]), 64)
+			if err != nil {
+				return fmt.Errorf("can't parse avg_query_count for %s: %w", database, err)
+			}
+		}
 
-        avgRecvBps := 0.0
-        if avgRecvIdx != -1 && rawColumns[avgRecvIdx] != nil {
-            avgRecvBps, err = strconv.ParseFloat(string(rawColumns[avgRecvIdx]), 64)
-            if err != nil {
-                return fmt.Errorf("can't parse avg_recv for %s: %w", database, err)
-            }
-        }
+		avgRecvBps := 0.0
+		if avgRecvIdx != -1 && rawColumns[avgRecvIdx] != nil {
+			avgRecvBps, err = strconv.ParseFloat(string(rawColumns[avgRecvIdx]), 64)
+			if err != nil {
+				return fmt.Errorf("can't parse avg_recv for %s: %w", database, err)
+			}
+		}
 
-        avgSentBps := 0.0
-        if avgSentIdx != -1 && rawColumns[avgSentIdx] != nil {
-            avgSentBps, err = strconv.ParseFloat(string(rawColumns[avgSentIdx]), 64)
-            if err != nil {
-                return fmt.Errorf("can't parse avg_sent for %s: %w", database, err)
-            }
-        }
+		avgSentBps := 0.0
+		if avgSentIdx != -1 && rawColumns[avgSentIdx] != nil {
+			avgSentBps, err = strconv.ParseFloat(string(rawColumns[avgSentIdx]), 64)
+			if err != nil {
+				return fmt.Errorf("can't parse avg_sent for %s: %w", database, err)
+			}
+		}
 
-        // SHOW STATS times are in microseconds; convert to seconds for *_seconds metrics
-        avgXactTimeSec := 0.0
-        if avgXactTimeIdx != -1 && rawColumns[avgXactTimeIdx] != nil {
-            v, convErr := strconv.ParseFloat(string(rawColumns[avgXactTimeIdx]), 64)
-            if convErr != nil {
-                return fmt.Errorf("can't parse avg_xact_time for %s: %w", database, convErr)
-            }
-            avgXactTimeSec = v / 1e6
-        }
+		// SHOW STATS times are in microseconds; convert to seconds for *_seconds metrics
+		avgXactTimeSec := 0.0
+		if avgXactTimeIdx != -1 && rawColumns[avgXactTimeIdx] != nil {
+			v, convErr := strconv.ParseFloat(string(rawColumns[avgXactTimeIdx]), 64)
+			if convErr != nil {
+				return fmt.Errorf("can't parse avg_xact_time for %s: %w", database, convErr)
+			}
+			avgXactTimeSec = v / 1e6
+		}
 
-        avgQueryTimeSec := 0.0
-        if avgQueryTimeIdx != -1 && rawColumns[avgQueryTimeIdx] != nil {
-            v, convErr := strconv.ParseFloat(string(rawColumns[avgQueryTimeIdx]), 64)
-            if convErr != nil {
-                return fmt.Errorf("can't parse avg_query_time for %s: %w", database, convErr)
-            }
-            avgQueryTimeSec = v / 1e6
-        }
+		avgQueryTimeSec := 0.0
+		if avgQueryTimeIdx != -1 && rawColumns[avgQueryTimeIdx] != nil {
+			v, convErr := strconv.ParseFloat(string(rawColumns[avgQueryTimeIdx]), 64)
+			if convErr != nil {
+				return fmt.Errorf("can't parse avg_query_time for %s: %w", database, convErr)
+			}
+			avgQueryTimeSec = v / 1e6
+		}
 
-        avgWaitTimeSec := 0.0
-        if avgWaitTimeIdx != -1 && rawColumns[avgWaitTimeIdx] != nil {
-            v, convErr := strconv.ParseFloat(string(rawColumns[avgWaitTimeIdx]), 64)
-            if convErr != nil {
-                return fmt.Errorf("can't parse avg_wait_time for %s: %w", database, convErr)
-            }
-            avgWaitTimeSec = v / 1e6
-        }
+		avgWaitTimeSec := 0.0
+		if avgWaitTimeIdx != -1 && rawColumns[avgWaitTimeIdx] != nil {
+			v, convErr := strconv.ParseFloat(string(rawColumns[avgWaitTimeIdx]), 64)
+			if convErr != nil {
+				return fmt.Errorf("can't parse avg_wait_time for %s: %w", database, convErr)
+			}
+			avgWaitTimeSec = v / 1e6
+		}
 
 		ch <- prometheus.MustNewConstMetric(
 			avgTxCountDescription,
@@ -774,65 +839,69 @@ func (exporter *Exporter) sendStatsMetrics(ch chan<- prometheus.Metric, db *sql.
 			database,
 		)
 
-        ch <- prometheus.MustNewConstMetric(
-            avgQueryCountDescription,
-            prometheus.GaugeValue,
-            avgQueryValue,
-            database,
-        )
+		ch <- prometheus.MustNewConstMetric(
+			avgQueryCountDescription,
+			prometheus.GaugeValue,
+			avgQueryValue,
+			database,
+		)
 
-        if avgRecvIdx != -1 {
-            ch <- prometheus.MustNewConstMetric(
-                avgRecvBytesPerSecondDescription,
-                prometheus.GaugeValue,
-                avgRecvBps,
-                database,
-            )
-        }
-        if avgSentIdx != -1 {
-            ch <- prometheus.MustNewConstMetric(
-                avgSentBytesPerSecondDescription,
-                prometheus.GaugeValue,
-                avgSentBps,
-                database,
-            )
-        }
-        if avgXactTimeIdx != -1 {
-            ch <- prometheus.MustNewConstMetric(
-                avgXactTimeSecondsDescription,
-                prometheus.GaugeValue,
-                avgXactTimeSec,
-                database,
-            )
-        }
-        if avgQueryTimeIdx != -1 {
-            ch <- prometheus.MustNewConstMetric(
-                avgQueryTimeSecondsDescription,
-                prometheus.GaugeValue,
-                avgQueryTimeSec,
-                database,
-            )
-        }
-        if avgWaitTimeIdx != -1 {
-            ch <- prometheus.MustNewConstMetric(
-                avgWaitTimeSecondsDescription,
-                prometheus.GaugeValue,
-                avgWaitTimeSec,
-                database,
-            )
-        }
+		if avgRecvIdx != -1 {
+			ch <- prometheus.MustNewConstMetric(
+				avgRecvBytesPerSecondDescription,
+				prometheus.GaugeValue,
+				avgRecvBps,
+				database,
+			)
+		}
+		if avgSentIdx != -1 {
+			ch <- prometheus.MustNewConstMetric(
+				avgSentBytesPerSecondDescription,
+				prometheus.GaugeValue,
+				avgSentBps,
+				database,
+			)
+		}
+		if avgXactTimeIdx != -1 {
+			ch <- prometheus.MustNewConstMetric(
+				avgXactTimeSecondsDescription,
+				prometheus.GaugeValue,
+				avgXactTimeSec,
+				database,
+			)
+		}
+		if avgQueryTimeIdx != -1 {
+			ch <- prometheus.MustNewConstMetric(
+				avgQueryTimeSecondsDescription,
+				prometheus.GaugeValue,
+				avgQueryTimeSec,
+				database,
+			)
+		}
+		if avgWaitTimeIdx != -1 {
+			ch <- prometheus.MustNewConstMetric(
+				avgWaitTimeSecondsDescription,
+				prometheus.GaugeValue,
+				avgWaitTimeSec,
+				database,
+			)
+		}
 	}
 
 	return rows.Err()
 }
 
-func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, db *sql.DB, capacities map[routeKey]float64) error {
-	rows, err := db.Query(showPoolsExtendedCommand)
+func (exporter *Exporter) sendPoolsExtendedMetrics(ctx context.Context, ch chan<- prometheus.Metric, db *sql.DB, capacities map[routeKey]float64) error {
+	rows, err := db.QueryContext(ctx, showPoolsExtendedCommand)
 	if err != nil {
 		return fmt.Errorf("error getting pools: %w", err)
 	}
 	defer rows.Close()
 
+	return exporter.processPoolsExtendedRows(rows, capacities, ch)
+}
+
+func (exporter *Exporter) processPoolsExtendedRows(rows rowIterator, capacities map[routeKey]float64, ch chan<- prometheus.Metric) error {
 	columns, err := rows.Columns()
 	if err != nil {
 		return fmt.Errorf("can't get columns of pools")
@@ -841,169 +910,175 @@ func (exporter *Exporter) sendPoolsExtendedMetrics(ch chan<- prometheus.Metric, 
 		return fmt.Errorf("invalid format of pools output")
 	}
 
-    for rows.Next() {
-		vals := make([]interface{}, len(columns))
-		for i := range vals {
-			vals[i] = new(interface{})
+	values := make([]interface{}, len(columns))
+	scanTargets := make([]interface{}, len(columns))
+	for i := range scanTargets {
+		scanTargets[i] = &values[i]
+	}
+
+	for rows.Next() {
+		for i := range values {
+			values[i] = nil
 		}
 
-		if err = rows.Scan(vals...); err != nil {
+		if err := rows.Scan(scanTargets...); err != nil {
 			return fmt.Errorf("error scanning pool extended row: %w", err)
 		}
 
-		databaseValue := *(vals[0].(*interface{}))
-		database, ok := databaseValue.(string)
-		if !ok {
-			return fmt.Errorf("first column %q is not string, expected name, got value of type %T", columns[0], vals[0])
+		if err := exporter.processPoolRow(columns, values, capacities, ch); err != nil {
+			return err
 		}
+	}
 
-		userValue := *(vals[1].(*interface{}))
-		user, ok := userValue.(string)
-		if !ok {
-			return fmt.Errorf("second column %s is not string, expected name, got value of type %T", columns[1], vals[1])
-		}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating pools rows: %w", err)
+	}
 
-		if database == "aggregated" && user == "aggregated" {
+	return nil
+}
+
+func (exporter *Exporter) processPoolRow(columns []string, values []interface{}, capacities map[routeKey]float64, ch chan<- prometheus.Metric) error {
+	database, err := extractString(values[0], columns[0])
+	if err != nil {
+		return err
+	}
+
+	user, err := extractString(values[1], columns[1])
+	if err != nil {
+		return err
+	}
+
+	if database == "aggregated" && user == "aggregated" {
+		return nil
+	}
+
+	serverActive := 0.0
+	serverIdle := 0.0
+	serverUsed := 0.0
+	serverTested := 0.0
+	serverLogin := 0.0
+
+	for i := 2; i < len(columns); i++ {
+		columnName := columns[i]
+		val := values[i]
+
+		if columnName == poolModeColumnName {
+			if val == nil {
+				continue
+			}
+			mode, err := extractString(val, poolModeColumnName)
+			if err != nil {
+				return err
+			}
+			writePoolModeInfoMetric(ch, database, user, mode)
 			continue
 		}
 
-        serverActive := 0.0
-        serverIdle := 0.0
-        serverUsed := 0.0
-        serverTested := 0.0
-        serverLogin := 0.0
-
-		for i := 2; i < len(columns); i++ {
-			columnName := columns[i]
-
-			val := *(vals[i].(*interface{}))
-
-			if columnName == poolModeColumnName {
-				if val == nil {
-					continue
-				}
-				var mode string
-				switch v := val.(type) {
-				case string:
-					mode = v
-				case []uint8:
-					mode = string(v)
-				default:
-					return fmt.Errorf("expected column %q to be string, got %T", poolModeColumnName, val)
-				}
-				writePoolModeInfoMetric(ch, database, user, mode)
-				continue
+		if strings.HasPrefix(columnName, queryQuantilePrefix) {
+			value, _, err := extractFloat(val, columnName)
+			if err != nil {
+				return err
 			}
+			quantile := strings.TrimPrefix(columnName, queryQuantilePrefix)
+			ch <- prometheus.MustNewConstMetric(
+				routeQueryDurationSecondsDescription,
+				prometheus.GaugeValue,
+				value,
+				user, database, quantile,
+			)
+			continue
+		}
 
-            if strings.HasPrefix(columnName, queryQuantilePrefix) {
-                value, _, err := extractFloat(val, columnName)
-                if err != nil {
-                    return err
-                }
-                quantile := strings.TrimPrefix(columnName, queryQuantilePrefix)
-				ch <- prometheus.MustNewConstMetric(
-					routeQueryDurationSecondsDescription,
-					prometheus.GaugeValue,
-					value,
-					user, database, quantile,
-				)
-				continue
+		if strings.HasPrefix(columnName, transactionQuantilePrefix) {
+			value, _, err := extractFloat(val, columnName)
+			if err != nil {
+				return err
 			}
+			quantile := strings.TrimPrefix(columnName, transactionQuantilePrefix)
+			ch <- prometheus.MustNewConstMetric(
+				routeTransactionDurationSecondsDescription,
+				prometheus.GaugeValue,
+				value,
+				user, database, quantile,
+			)
+			continue
+		}
 
-            if strings.HasPrefix(columnName, transactionQuantilePrefix) {
-                value, _, err := extractFloat(val, columnName)
-                if err != nil {
-                    return err
-                }
-                quantile := strings.TrimPrefix(columnName, transactionQuantilePrefix)
-				ch <- prometheus.MustNewConstMetric(
-					routeTransactionDurationSecondsDescription,
-					prometheus.GaugeValue,
-					value,
-					user, database, quantile,
-				)
-				continue
-			}
+		value, _, err := extractFloat(val, columnName)
+		if err != nil {
+			return err
+		}
 
-            value, _, err := extractFloat(val, columnName)
-            if err != nil {
-                return err
-            }
+		switch columnName {
+		case "sv_active":
+			serverActive = value
+			continue
+		case "sv_idle":
+			serverIdle = value
+			continue
+		case "sv_used":
+			serverUsed = value
+			continue
+		case "sv_tested":
+			serverTested = value
+			continue
+		case "sv_login":
+			serverLogin = value
+			continue
+		}
 
-            switch columnName {
-            case "sv_active":
-                serverActive = value
-                continue
-            case "sv_idle":
-                serverIdle = value
-                continue
-            case "sv_used":
-                serverUsed = value
-                continue
-            case "sv_tested":
-                serverTested = value
-                continue
-            case "sv_login":
-                serverLogin = value
-                continue
-            }
+		// Ignore deprecated microseconds column silently
+		if columnName == "maxwait_us" {
+			continue
+		}
 
-            // Ignore deprecated microseconds column silently
-            if columnName == "maxwait_us" {
-                continue
-            }
+		if metricDesc, ok := poolsExtendedColumnToMetric[columnName]; ok {
+			ch <- prometheus.MustNewConstMetric(
+				metricDesc.desc,
+				metricDesc.valueType,
+				value,
+				user, database,
+			)
+			continue
+		}
 
-            if metricDesc, ok := poolsExtendedColumnToMetric[columnName]; ok {
-                ch <- prometheus.MustNewConstMetric(
-                    metricDesc.desc,
-                    metricDesc.valueType,
-                    value,
-                    user, database,
-                )
-                continue
-            }
+		return fmt.Errorf("got unexpected column %q", columnName)
+	}
 
-            return fmt.Errorf("got unexpected column %q", columnName)
-        }
+	// Always export configured capacity (0 means unlimited) based on SHOW DATABASES
+	// Prefer exact database+user match; fall back to database-only if present
+	var configuredCapacity float64
+	if v, ok := capacities[routeKey{database: database, user: user}]; ok {
+		configuredCapacity = v
+	} else if v, ok := capacities[routeKey{database: database, user: ""}]; ok {
+		configuredCapacity = v
+	}
 
-        // Per-state values are available via the unified family below
+	// If SHOW DATABASES did not yield a capacity for this route (or reported 0/unlimited),
+	// fall back to the observed current server slots (sv_active + sv_idle) as a best-effort proxy.
+	if configuredCapacity <= 0 {
+		configuredCapacity = serverActive + serverIdle
+	}
+	ch <- prometheus.MustNewConstMetric(
+		serverPoolCapacityConfiguredRouteDescription,
+		prometheus.GaugeValue,
+		configuredCapacity,
+		user, database,
+	)
 
-        // Always export configured capacity (0 means unlimited) based on SHOW DATABASES
-        // Prefer exact database+user match; fall back to database-only if present
-        var configuredCapacity float64
-        if v, ok := capacities[routeKey{database: database, user: user}]; ok {
-            configuredCapacity = v
-        } else if v, ok := capacities[routeKey{database: database, user: ""}]; ok {
-            configuredCapacity = v
-        }
+	// Unified state metric family
+	ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverActive, user, database, "active")
+	ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverIdle, user, database, "idle")
+	ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverUsed, user, database, "used")
+	ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverTested, user, database, "tested")
+	ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverLogin, user, database, "login")
 
-        // If SHOW DATABASES did not yield a capacity for this route (or reported 0/unlimited),
-        // fall back to the observed current server slots (sv_active + sv_idle) as a best-effort proxy.
-        if configuredCapacity <= 0 {
-            configuredCapacity = serverActive + serverIdle
-        }
-        ch <- prometheus.MustNewConstMetric(
-            serverPoolCapacityConfiguredRouteDescription,
-            prometheus.GaugeValue,
-            configuredCapacity,
-            user, database,
-        )
-
-        // Current connections can be derived as active+idle from the unified state family
-
-        // Unified state metric family
-        ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverActive, user, database, "active")
-        ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverIdle, user, database, "idle")
-        ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverUsed, user, database, "used")
-        ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverTested, user, database, "tested")
-        ch <- prometheus.MustNewConstMetric(serverPoolStateRouteDescription, prometheus.GaugeValue, serverLogin, user, database, "login")
-    }
-
-    return nil
+	return nil
 }
 
 func main() {
 	connectionStringPtr := kingpin.Flag("odyssey.connectionString", "Connection string for accessing Odyssey.").Default("host=localhost port=6432 user=console dbname=console sslmode=disable").String()
+	scrapeTimeoutPtr := kingpin.Flag("odyssey.scrape-timeout", "Maximum duration allowed for a single scrape (e.g. 5s, 30s).").Default("5s").Duration()
 
 	toolkitFlags := kingpinflag.AddFlags(kingpin.CommandLine, ":9876")
 
@@ -1022,10 +1097,33 @@ func main() {
 		os.Exit(1)
 	}
 
-	prometheus.MustRegister(exporter)
 	prometheus.MustRegister(versioncollector.NewCollector("odyssey_exporter"))
 
-	http.Handle(metricsHandlePath, promhttp.Handler())
+	handlerOpts := promhttp.HandlerOpts{
+		ErrorHandling: promhttp.ContinueOnError,
+	}
+
+	http.HandleFunc(metricsHandlePath, func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		if timeout := *scrapeTimeoutPtr; timeout > 0 {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, timeout)
+			defer cancel()
+		}
+
+		perScrapeRegistry := prometheus.NewRegistry()
+		perScrapeRegistry.MustRegister(&contextCollector{
+			exporter: exporter,
+			ctx:      ctx,
+		})
+
+		gatherers := prometheus.Gatherers{
+			perScrapeRegistry,
+			prometheus.DefaultGatherer,
+		}
+
+		promhttp.HandlerFor(gatherers, handlerOpts).ServeHTTP(w, r)
+	})
 
 	landingConfig := web.LandingConfig{
 		Name:        "Odyssey Exporter",
