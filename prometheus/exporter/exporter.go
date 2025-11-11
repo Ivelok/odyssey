@@ -979,6 +979,7 @@ func (exporter *Exporter) processPoolRow(columns []string, values []interface{},
 			if err != nil {
 				return err
 			}
+			value = value / 1e6
 			quantile := strings.TrimPrefix(columnName, queryQuantilePrefix)
 			ch <- prometheus.MustNewConstMetric(
 				routeQueryDurationSecondsDescription,
@@ -994,6 +995,7 @@ func (exporter *Exporter) processPoolRow(columns []string, values []interface{},
 			if err != nil {
 				return err
 			}
+			value = value / 1e6
 			quantile := strings.TrimPrefix(columnName, transactionQuantilePrefix)
 			ch <- prometheus.MustNewConstMetric(
 				routeTransactionDurationSecondsDescription,
